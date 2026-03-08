@@ -729,6 +729,10 @@ class ReferenceImageMapper(neon_player.Plugin):
     def reference_image_path(self, value: FilePath) -> None:
         old = self._reference_image_path
         self._reference_image_path = value
+        # During state restoration (_setting_state=True) just accept the value
+        # without clearing the cache — the cache is keyed to this path already.
+        if getattr(self, "_setting_state", False):
+            return
         if old != value and self.recording is not None:
             # Clear old cache when a new image is selected
             cache_file = self.get_cache_path() / "homographies.npy"
