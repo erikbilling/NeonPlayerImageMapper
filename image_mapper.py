@@ -162,9 +162,9 @@ class ReferenceImageMapper(neon_player.Plugin):
         self.ref_w = 0
 
         self._reference_image_path = FilePath()
-        self._start_time = 10.0
-        self._stop_time = 30.0
-        self._min_matches = 8
+        self._start_time = 00.0
+        self._stop_time = 25.0
+        self._min_matches = 10
         self._aoi: list[list[float]] | None = None  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in ref image coords
         self._outline_color = QColor(Qt.GlobalColor.green)
         self._gaze_color = QColor(Qt.GlobalColor.red)
