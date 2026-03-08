@@ -12,9 +12,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QDialog, QFileDialog, QLabel, QVBoxLayout
-from qt_property_widgets.utilities import FilePath, property_params
+from qt_property_widgets.utilities import FilePath, action_params, property_params
 
 from pupil_labs import neon_player
 from pupil_labs.neon_player import ProgressUpdate
@@ -814,6 +814,7 @@ class ReferenceImageMapper(neon_player.Plugin):
         self._load_or_compute_cache()
 
     @neon_player.action
+    @action_params(compact=True, icon=QIcon(str(neon_player.asset_path("export.svg"))))
     def export_eaf(self) -> None:
         """Export gaze-in-AOI intervals as an ELAN (.eaf) annotation file
         together with a rendered MP4 video covering the start–stop window."""
