@@ -675,32 +675,34 @@ class ReferenceImageMapper(neon_player.Plugin):
         scene_roi = cv2.perspectiveTransform(roi_corners, H_inv)
         scene_pts = scene_roi.reshape(-1, 2)
 
-        # Draw outline of the AOI in the scene
-        pen = QPen(self.outline_color, 3, Qt.PenStyle.SolidLine)
+        # Map gaze to reference image coordinates
+        gaze_samples = self._get_gazes_for_scene(scene_idx)
+        in_region = False
+        gaze_x, gaze_y = 0.0, 0.0
+        ref_x, ref_y = 0.0, 0.0
+        has_gaze = len(gaze_samples.point) > 0
+
+        if has_gaze:
+            gaze_x, gaze_y = gaze_samples.point.mean(axis=0)
+            gaze_pt = np.float32([[gaze_x, gaze_y]]).reshape(-1, 1, 2)
+            mapped = cv2.perspectiveTransform(gaze_pt, H)
+            ref_x, ref_y = mapped[0][0]
+
+            if self._aoi is not None:
+                in_region = self._point_in_aoi(ref_x, ref_y)
+            else:
+                in_region = 0 <= ref_x <= self.ref_w and 0 <= ref_y <= self.ref_h
+
+        # Draw outline of the AOI in the scene (red when gaze is inside)
+        frame_color = QColor(255, 0, 0) if in_region else self.outline_color
+        pen = QPen(frame_color, 3, Qt.PenStyle.SolidLine)
         painter.setPen(pen)
         for i in range(4):
             x1, y1 = scene_pts[i]
             x2, y2 = scene_pts[(i + 1) % 4]
             painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
-        # Map gaze to reference image coordinates
-        gaze_samples = self._get_gazes_for_scene(scene_idx)
-        if len(gaze_samples.point) == 0:
-            return
-
-        # Use the mean gaze point for the current frame
-        gaze_x, gaze_y = gaze_samples.point.mean(axis=0)
-        gaze_pt = np.float32([[gaze_x, gaze_y]]).reshape(-1, 1, 2)
-        mapped = cv2.perspectiveTransform(gaze_pt, H)
-        ref_x, ref_y = mapped[0][0]
-
-        # Check if mapped gaze is within the AOI (or full image if no AOI)
-        if self._aoi is not None:
-            in_region = self._point_in_aoi(ref_x, ref_y)
-        else:
-            in_region = 0 <= ref_x <= self.ref_w and 0 <= ref_y <= self.ref_h
-
-        if in_region:
+        if has_gaze and in_region:
             # Draw gaze circle on the scene at the original gaze position
             painter.setPen(QPen(self.gaze_color, 2, Qt.PenStyle.SolidLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
