@@ -173,6 +173,21 @@ class ReferenceImageMapper(neon_player.Plugin):
 
         self.mapping_job = None
         self._disable_rebuild_on_next_cache_load = False
+        self._configure_export_action_args()
+
+    def _configure_export_action_args(self) -> None:
+        """Set UI metadata for export action arguments."""
+        action_obj = self._action_objects.get("export_eaf")
+        if action_obj is None:
+            return
+
+        merge_prop = getattr(action_obj.__class__, "merge_gap_ms", None)
+        if merge_prop is not None and hasattr(merge_prop, "fget"):
+            merge_prop.fget.parameters = {
+                "min": 0,
+                "max": 1000,
+                "step": 1,
+            }
 
     # ------------------------------------------------------------------ #
     # Recording lifecycle
@@ -883,7 +898,11 @@ class ReferenceImageMapper(neon_player.Plugin):
 
     @neon_player.action
     @action_params(icon=QIcon(str(neon_player.asset_path("export.svg"))))
-    def export_eaf(self, rebuild_mapping_on_export: bool = False) -> None:
+    def export_eaf(
+        self,
+        rebuild_mapping_on_export: bool = False,
+        merge_gap_ms: int = 200,
+    ) -> None:
         """Export gaze-in-AOI intervals as an ELAN (.eaf) annotation file
         together with a rendered MP4 video covering the start–stop window."""
         if self.ref_image is None:
@@ -927,16 +946,22 @@ class ReferenceImageMapper(neon_player.Plugin):
                 "ReferenceImageMapper.bg_export_eaf",
                 out_path,
                 int(rebuild_mapping_on_export),
+                int(merge_gap_ms),
             )
             return
 
-        for _ in self.bg_export_eaf(out_path, int(rebuild_mapping_on_export)):
+        for _ in self.bg_export_eaf(
+            out_path,
+            int(rebuild_mapping_on_export),
+            int(merge_gap_ms),
+        ):
             pass
 
     def bg_export_eaf(
         self,
         out_path: Path = Path(),
         rebuild_mapping: int = 0,
+        merge_gap_ms: int = 200,
     ) -> T.Generator[ProgressUpdate, None, None]:
         """Background export job with progress updates for remapping and video export."""
         if self.ref_image is None:
@@ -1023,6 +1048,18 @@ class ReferenceImageMapper(neon_player.Plugin):
                 (scene_times[window_indices[-1]] - window_start_ns) / 1e6
             )
             intervals.append((start_ms, last_ms))
+
+        # Merge intervals separated by short gaps to avoid fragmented annotations.
+        merge_gap_ms = max(0, int(merge_gap_ms))
+        if intervals:
+            merged_intervals = [intervals[0]]
+            for start, end in intervals[1:]:
+                prev_start, prev_end = merged_intervals[-1]
+                if start - prev_end < merge_gap_ms:
+                    merged_intervals[-1] = (prev_start, max(prev_end, end))
+                else:
+                    merged_intervals.append((start, end))
+            intervals = merged_intervals
 
         if not intervals:
             logger.info("No gaze-in-AOI intervals found — nothing to export")
