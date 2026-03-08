@@ -758,6 +758,17 @@ class ReferenceImageMapper(neon_player.Plugin):
     def stop_time(self, value: float) -> None:
         self._stop_time = value
 
+    @property
+    @property_params(widget=None)
+    def aoi(self) -> list[list]:
+        return self._aoi if self._aoi is not None else []
+
+    @aoi.setter
+    def aoi(self, value: list[list]) -> None:
+        self._aoi = value if value else None
+        if not self._setting_state:
+            self.changed.emit()
+
     @neon_player.action
     def area_of_interest(self) -> None:
         """Open a window to select an AOI quadrilateral on the reference image."""
@@ -781,10 +792,10 @@ class ReferenceImageMapper(neon_player.Plugin):
         if dialog.exec() == QDialog.DialogCode.Accepted or True:
             sel = label.selected_quad
             if sel is not None:
-                self._aoi = sel
+                self.aoi = sel
                 logger.info("AOI set to: %s", self._aoi)
             else:
-                self._aoi = None
+                self.aoi = []
                 logger.info("AOI cleared")
 
     @neon_player.action
