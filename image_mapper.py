@@ -7,19 +7,21 @@
 # ///
 import logging
 import typing as T
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QDialog, QFileDialog, QLabel, QProgressDialog, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QFileDialog, QLabel, QVBoxLayout
 from qt_property_widgets.utilities import FilePath, property_params
 
 from pupil_labs import neon_player
 from pupil_labs.neon_player import ProgressUpdate
 from pupil_labs.neon_recording import NeonRecording
+
+from .elan_export import write_eaf
+from .video_export import export_video
 
 
 logger = logging.getLogger(__name__)
@@ -835,7 +837,7 @@ class ReferenceImageMapper(neon_player.Plugin):
             logger.info("No frames in the start/stop window")
             return
 
-        window_start_ns = scene_times[window_indices[0]]  # absolute timestamp
+        window_start_ns = scene_times[window_indices[0]]
 
         # ---- Determine which window-frames have gaze inside the AOI ---- #
         in_aoi_flags: list[bool] = []
@@ -860,8 +862,7 @@ class ReferenceImageMapper(neon_player.Plugin):
 
             in_aoi_flags.append(is_in)
 
-        # ---- Merge consecutive True frames into intervals ---- #
-        # Times are relative to the start of the export window (ms)
+        # ---- Merge consecutive True frames into intervals (ms) ---- #
         intervals: list[tuple[int, int]] = []
         in_interval = False
         start_ms = 0
@@ -889,7 +890,8 @@ class ReferenceImageMapper(neon_player.Plugin):
         ref_name = Path(self._reference_image_path).stem
         tier_id = ref_name if ref_name else "ReferenceImage"
         default_dir = str(self.recording._rec_dir) if self.recording else str(Path.home())
-        default_path = str(Path(default_dir) / f"{tier_id}.eaf")
+        recording_name = self.recording._rec_dir.name if self.recording else tier_id
+        default_path = str(Path(default_dir) / f"{recording_name}.eaf")
         out_path, _ = QFileDialog.getSaveFileName(
             None, "Export EAF", default_path, "ELAN files (*.eaf)"
         )
@@ -897,139 +899,14 @@ class ReferenceImageMapper(neon_player.Plugin):
             logger.info("EAF export cancelled")
             return
         out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         # ---- Export rendered MP4 video ---- #
         video_path = out_path.with_suffix(".mp4")
-        vid_w = self.recording.scene.width
-        vid_h = self.recording.scene.height
-
-        # Compute FPS from actual frame timestamps in the window
-        n_frames = len(window_indices)
-        duration_ns = scene_times[window_indices[-1]] - window_start_ns
-        fps = (n_frames - 1) / (duration_ns / 1e9) if duration_ns > 0 and n_frames > 1 else 30.0
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (vid_w, vid_h))
-
-        if not writer.isOpened():
-            logger.error("Failed to open video writer for %s", video_path)
+        if not export_video(video_path, scene_times, window_indices):
             return
 
-        app = neon_player.instance()
-        progress = QProgressDialog("Exporting video…", "Cancel", 0, n_frames)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-
-        try:
-            for seq, frame_idx in enumerate(window_indices):
-                if progress.wasCanceled():
-                    logger.info("Video export cancelled")
-                    writer.release()
-                    if video_path.exists():
-                        video_path.unlink()
-                    return
-
-                ts = int(scene_times[frame_idx])
-
-                # Render to an off-screen QImage at the native scene resolution
-                qimg = QImage(vid_w, vid_h, QImage.Format.Format_ARGB32)
-                qimg.fill(0)
-                painter = QPainter(qimg)
-                painter.setRenderHints(
-                    QPainter.RenderHint.Antialiasing
-                    | QPainter.RenderHint.SmoothPixmapTransform
-                )
-                app.render_to(painter, ts)
-                painter.end()
-
-                # Convert QImage (ARGB32) to BGR numpy array for OpenCV
-                qimg_rgb = qimg.convertToFormat(QImage.Format.Format_RGB888)
-                ptr = qimg_rgb.bits()
-                arr = np.frombuffer(ptr, dtype=np.uint8).reshape(vid_h, vid_w, 3)
-                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                writer.write(bgr)
-
-                progress.setValue(seq + 1)
-        finally:
-            writer.release()
-            progress.close()
-
-        logger.info(
-            "Video exported to %s (%d frames, %.2f fps)", video_path, n_frames, fps
-        )
-
-        # ---- Build EAF XML ---- #
-        video_rel = video_path.name  # relative to .eaf location
-
-        root = ET.Element("ANNOTATION_DOCUMENT", {
-            "AUTHOR": "ReferenceImageMapper",
-            "DATE": "",
-            "FORMAT": "3.0",
-            "VERSION": "3.0",
-            "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
-            "xsi:noNamespaceSchemaLocation":
-                "http://www.mpi.nl/tools/elan/EAFv3.0.xsd",
-        })
-
-        header = ET.SubElement(root, "HEADER", {
-            "MEDIA_FILE": "",
-            "TIME_UNITS": "milliseconds",
-        })
-        ET.SubElement(header, "MEDIA_DESCRIPTOR", {
-            "MEDIA_URL": f"file://./{video_rel}",
-            "MIME_TYPE": "video/mp4",
-            "RELATIVE_MEDIA_URL": f"./{video_rel}",
-        })
-        ET.SubElement(header, "PROPERTY", {
-            "NAME": "URN",
-        }).text = ""
-
-        # Time slots
-        time_order = ET.SubElement(root, "TIME_ORDER")
-        ts_id = 1
-        annotation_slots: list[tuple[str, str]] = []
-        for start, end in intervals:
-            ts_start = f"ts{ts_id}"
-            ts_end = f"ts{ts_id + 1}"
-            ET.SubElement(time_order, "TIME_SLOT", {
-                "TIME_SLOT_ID": ts_start,
-                "TIME_VALUE": str(start),
-            })
-            ET.SubElement(time_order, "TIME_SLOT", {
-                "TIME_SLOT_ID": ts_end,
-                "TIME_VALUE": str(end),
-            })
-            annotation_slots.append((ts_start, ts_end))
-            ts_id += 2
-
-        # Tier with annotations
-        tier = ET.SubElement(root, "TIER", {
-            "LINGUISTIC_TYPE_REF": "default-lt",
-            "TIER_ID": tier_id,
-        })
-
-        for ann_idx, (ts_start, ts_end) in enumerate(annotation_slots):
-            ann = ET.SubElement(tier, "ANNOTATION")
-            alignable = ET.SubElement(ann, "ALIGNABLE_ANNOTATION", {
-                "ANNOTATION_ID": f"a{ann_idx + 1}",
-                "TIME_SLOT_REF1": ts_start,
-                "TIME_SLOT_REF2": ts_end,
-            })
-            ET.SubElement(alignable, "ANNOTATION_VALUE").text = tier_id
-
-        # Linguistic type
-        ET.SubElement(root, "LINGUISTIC_TYPE", {
-            "GRAPHIC_REFERENCES": "false",
-            "LINGUISTIC_TYPE_ID": "default-lt",
-            "TIME_ALIGNABLE": "true",
-        })
-
-        # Write EAF file
-        tree = ET.ElementTree(root)
-        ET.indent(tree, space="    ")
-        tree.write(str(out_path), encoding="unicode", xml_declaration=True)
-        logger.info("EAF exported to %s (%d annotations)", out_path, len(intervals))
+        # ---- Write EAF file ---- #
+        write_eaf(out_path, tier_id, intervals, video_filename=video_path.name)
 
     @property
     @property_params(min=4, max=100, step=1)
