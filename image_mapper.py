@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QDialog, QFileDialog, QLabel, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QFileDialog, QLabel, QProgressDialog, QVBoxLayout
 from qt_property_widgets.utilities import FilePath, property_params
 
 from pupil_labs import neon_player
@@ -813,17 +813,34 @@ class ReferenceImageMapper(neon_player.Plugin):
 
     @neon_player.action
     def export_eaf(self) -> None:
-        """Export gaze-in-AOI intervals as an ELAN (.eaf) annotation file."""
+        """Export gaze-in-AOI intervals as an ELAN (.eaf) annotation file
+        together with a rendered MP4 video covering the start–stop window."""
         if self.homographies is None or self.ref_image is None:
             logger.info("No mapping data — run remap first")
             return
 
-        # ---- Determine which frames have gaze inside the AOI ---- #
+        # ---- Identify frames inside the start/stop window ---- #
         scene_times = self.recording.scene.time
         rec_start = scene_times[0]
+        start_ns = int(self._start_time * 1e9)
+        stop_ns = int(self._stop_time * 1e9)
+
+        window_indices: list[int] = []
+        for frame_idx in range(len(scene_times)):
+            elapsed = scene_times[frame_idx] - rec_start
+            if start_ns <= elapsed <= stop_ns:
+                window_indices.append(frame_idx)
+
+        if not window_indices:
+            logger.info("No frames in the start/stop window")
+            return
+
+        window_start_ns = scene_times[window_indices[0]]  # absolute timestamp
+
+        # ---- Determine which window-frames have gaze inside the AOI ---- #
         in_aoi_flags: list[bool] = []
 
-        for frame_idx in range(len(self.homographies)):
+        for frame_idx in window_indices:
             entry = self.homographies[frame_idx]
             is_in = False
 
@@ -844,12 +861,13 @@ class ReferenceImageMapper(neon_player.Plugin):
             in_aoi_flags.append(is_in)
 
         # ---- Merge consecutive True frames into intervals ---- #
-        intervals: list[tuple[int, int]] = []  # (start_ms, end_ms)
+        # Times are relative to the start of the export window (ms)
+        intervals: list[tuple[int, int]] = []
         in_interval = False
         start_ms = 0
 
-        for frame_idx, is_in in enumerate(in_aoi_flags):
-            time_ms = int((scene_times[frame_idx] - rec_start) / 1e6)
+        for i, is_in in enumerate(in_aoi_flags):
+            time_ms = int((scene_times[window_indices[i]] - window_start_ns) / 1e6)
             if is_in and not in_interval:
                 in_interval = True
                 start_ms = time_ms
@@ -857,18 +875,92 @@ class ReferenceImageMapper(neon_player.Plugin):
                 in_interval = False
                 intervals.append((start_ms, time_ms))
 
-        # Close a trailing interval
         if in_interval:
-            last_ms = int((scene_times[len(in_aoi_flags) - 1] - rec_start) / 1e6)
+            last_ms = int(
+                (scene_times[window_indices[-1]] - window_start_ns) / 1e6
+            )
             intervals.append((start_ms, last_ms))
 
         if not intervals:
             logger.info("No gaze-in-AOI intervals found — nothing to export")
             return
 
-        # ---- Build EAF XML ---- #
+        # ---- Ask user for save location ---- #
         ref_name = Path(self._reference_image_path).stem
         tier_id = ref_name if ref_name else "ReferenceImage"
+        default_dir = str(self.recording._rec_dir) if self.recording else str(Path.home())
+        default_path = str(Path(default_dir) / f"{tier_id}.eaf")
+        out_path, _ = QFileDialog.getSaveFileName(
+            None, "Export EAF", default_path, "ELAN files (*.eaf)"
+        )
+        if not out_path:
+            logger.info("EAF export cancelled")
+            return
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ---- Export rendered MP4 video ---- #
+        video_path = out_path.with_suffix(".mp4")
+        vid_w = self.recording.scene.width
+        vid_h = self.recording.scene.height
+
+        # Compute FPS from actual frame timestamps in the window
+        n_frames = len(window_indices)
+        duration_ns = scene_times[window_indices[-1]] - window_start_ns
+        fps = (n_frames - 1) / (duration_ns / 1e9) if duration_ns > 0 and n_frames > 1 else 30.0
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (vid_w, vid_h))
+
+        if not writer.isOpened():
+            logger.error("Failed to open video writer for %s", video_path)
+            return
+
+        app = neon_player.instance()
+        progress = QProgressDialog("Exporting video…", "Cancel", 0, n_frames)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+
+        try:
+            for seq, frame_idx in enumerate(window_indices):
+                if progress.wasCanceled():
+                    logger.info("Video export cancelled")
+                    writer.release()
+                    if video_path.exists():
+                        video_path.unlink()
+                    return
+
+                ts = int(scene_times[frame_idx])
+
+                # Render to an off-screen QImage at the native scene resolution
+                qimg = QImage(vid_w, vid_h, QImage.Format.Format_ARGB32)
+                qimg.fill(0)
+                painter = QPainter(qimg)
+                painter.setRenderHints(
+                    QPainter.RenderHint.Antialiasing
+                    | QPainter.RenderHint.SmoothPixmapTransform
+                )
+                app.render_to(painter, ts)
+                painter.end()
+
+                # Convert QImage (ARGB32) to BGR numpy array for OpenCV
+                qimg_rgb = qimg.convertToFormat(QImage.Format.Format_RGB888)
+                ptr = qimg_rgb.bits()
+                arr = np.frombuffer(ptr, dtype=np.uint8).reshape(vid_h, vid_w, 3)
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                writer.write(bgr)
+
+                progress.setValue(seq + 1)
+        finally:
+            writer.release()
+            progress.close()
+
+        logger.info(
+            "Video exported to %s (%d frames, %.2f fps)", video_path, n_frames, fps
+        )
+
+        # ---- Build EAF XML ---- #
+        video_rel = video_path.name  # relative to .eaf location
 
         root = ET.Element("ANNOTATION_DOCUMENT", {
             "AUTHOR": "ReferenceImageMapper",
@@ -884,6 +976,11 @@ class ReferenceImageMapper(neon_player.Plugin):
             "MEDIA_FILE": "",
             "TIME_UNITS": "milliseconds",
         })
+        ET.SubElement(header, "MEDIA_DESCRIPTOR", {
+            "MEDIA_URL": f"file://./{video_rel}",
+            "MIME_TYPE": "video/mp4",
+            "RELATIVE_MEDIA_URL": f"./{video_rel}",
+        })
         ET.SubElement(header, "PROPERTY", {
             "NAME": "URN",
         }).text = ""
@@ -891,7 +988,6 @@ class ReferenceImageMapper(neon_player.Plugin):
         # Time slots
         time_order = ET.SubElement(root, "TIME_ORDER")
         ts_id = 1
-        slot_map: dict[int, str] = {}  # annotation_idx -> (ts_start_id, ts_end_id)
         annotation_slots: list[tuple[str, str]] = []
         for start, end in intervals:
             ts_start = f"ts{ts_id}"
@@ -929,19 +1025,9 @@ class ReferenceImageMapper(neon_player.Plugin):
             "TIME_ALIGNABLE": "true",
         })
 
-        # Write file
+        # Write EAF file
         tree = ET.ElementTree(root)
         ET.indent(tree, space="    ")
-        default_dir = str(self.recording._rec_dir) if self.recording else str(Path.home())
-        default_path = str(Path(default_dir) / f"{tier_id}.eaf")
-        out_path, _ = QFileDialog.getSaveFileName(
-            None, "Export EAF", default_path, "ELAN files (*.eaf)"
-        )
-        if not out_path:
-            logger.info("EAF export cancelled")
-            return
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
         tree.write(str(out_path), encoding="unicode", xml_declaration=True)
         logger.info("EAF exported to %s (%d annotations)", out_path, len(intervals))
 
