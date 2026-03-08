@@ -161,7 +161,7 @@ class ReferenceImageMapper(neon_player.Plugin):
         self._reference_image_path = FilePath()
         self._start_time = 10.0
         self._stop_time = 30.0
-        self._min_matches = 15
+        self._min_matches = 8
         self._aoi: list[list[float]] | None = None  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in ref image coords
         self._outline_color = QColor(Qt.GlobalColor.green)
         self._gaze_color = QColor(Qt.GlobalColor.red)
@@ -253,8 +253,15 @@ class ReferenceImageMapper(neon_player.Plugin):
         which is critical for recovering short appearances.
         """
 
-        orb = cv2.ORB_create(nfeatures=2000)
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        orb = cv2.ORB_create(nfeatures=3000)
+
+        # FLANN-based matcher (LSH index for binary descriptors)
+        FLANN_INDEX_LSH = 6
+        index_params = dict(
+            algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1
+        )
+        search_params = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
 
         ref_gray = cv2.cvtColor(self.ref_image, cv2.COLOR_BGR2GRAY)
         kp_ref, des_ref = orb.detectAndCompute(ref_gray, None)
@@ -279,7 +286,7 @@ class ReferenceImageMapper(neon_player.Plugin):
         prev_scene_pts: np.ndarray | None = None
         ref_pts_for_of: np.ndarray | None = None
         of_miss_streak = 0
-        max_of_streak = 10
+        max_of_streak = 20
 
         homographies: list[dict[str, T.Any]] = []
         num_frames = len(self.recording.scene)
@@ -323,13 +330,13 @@ class ReferenceImageMapper(neon_player.Plugin):
             kp_scene, des_scene = orb.detectAndCompute(scene_gray, None)
 
             if des_scene is not None and des_ref is not None and len(kp_scene) >= 2:
-                matches = bf.knnMatch(des_ref, des_scene, k=2)
+                matches = flann.knnMatch(des_ref, des_scene, k=2)
 
                 good = []
                 for pair in matches:
                     if len(pair) == 2:
                         m, n = pair
-                        if m.distance < 0.75 * n.distance:
+                        if m.distance < 0.8 * n.distance:
                             good.append(m)
 
                 if len(good) >= self._min_matches:
@@ -341,13 +348,13 @@ class ReferenceImageMapper(neon_player.Plugin):
                     ).reshape(-1, 1, 2)
 
                     H, mask = cv2.findHomography(
-                        dst_pts, src_pts, cv2.RANSAC, 3.0
+                        dst_pts, src_pts, cv2.RANSAC, 5.0
                     )
                     inlier_ratio = (
                         mask.sum() / len(mask) if mask is not None else 0
                     )
 
-                    if H is not None and inlier_ratio >= 0.4:
+                    if H is not None and inlier_ratio >= 0.25:
                         H_inv = np.linalg.inv(H)
                         scene_corners = cv2.perspectiveTransform(
                             ref_corners, H_inv
@@ -398,7 +405,7 @@ class ReferenceImageMapper(neon_player.Plugin):
                             else 0
                         )
 
-                        if H is not None and inlier_ratio >= 0.35:
+                        if H is not None and inlier_ratio >= 0.2:
                             H_inv = np.linalg.inv(H)
                             scene_corners = cv2.perspectiveTransform(
                                 ref_corners, H_inv
@@ -496,7 +503,7 @@ class ReferenceImageMapper(neon_player.Plugin):
                             else 0
                         )
 
-                        if H is not None and inlier_ratio >= 0.35:
+                        if H is not None and inlier_ratio >= 0.2:
                             H_inv = np.linalg.inv(H)
                             scene_corners = cv2.perspectiveTransform(
                                 ref_corners, H_inv
@@ -578,15 +585,15 @@ class ReferenceImageMapper(neon_player.Plugin):
         )
         frame_area = frame_w * frame_h
         area_ratio = area / frame_area
-        if area_ratio < 0.005 or area_ratio > 0.95:
+        if area_ratio < 0.002 or area_ratio > 0.95:
             return False
 
-        # 3. Aspect ratio sanity — no edge should be more than 10x longer
+        # 3. Aspect ratio sanity — no edge should be more than 15x longer
         #    than another (rejects extreme perspective distortions)
         edges = [
             np.linalg.norm(corners[(i + 1) % n] - corners[i]) for i in range(n)
         ]
-        if max(edges) > 10 * min(edges):
+        if max(edges) > 15 * min(edges):
             return False
 
         return True
