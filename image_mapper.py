@@ -7,6 +7,7 @@
 # ///
 import logging
 import typing as T
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import cv2
@@ -792,6 +793,132 @@ class ReferenceImageMapper(neon_player.Plugin):
         if cache_file.exists():
             cache_file.unlink()
         self._load_or_compute_cache()
+
+    @neon_player.action
+    def export_eaf(self) -> None:
+        """Export gaze-in-AOI intervals as an ELAN (.eaf) annotation file."""
+        if self.homographies is None or self.ref_image is None:
+            logger.info("No mapping data — run remap first")
+            return
+
+        # ---- Determine which frames have gaze inside the AOI ---- #
+        scene_times = self.recording.scene.time
+        rec_start = scene_times[0]
+        in_aoi_flags: list[bool] = []
+
+        for frame_idx in range(len(self.homographies)):
+            entry = self.homographies[frame_idx]
+            is_in = False
+
+            if entry["found"]:
+                H = np.array(entry["H"])
+                gaze_samples = self._get_gazes_for_scene(frame_idx)
+                if len(gaze_samples.point) > 0:
+                    gaze_x, gaze_y = gaze_samples.point.mean(axis=0)
+                    gaze_pt = np.float32([[gaze_x, gaze_y]]).reshape(-1, 1, 2)
+                    mapped = cv2.perspectiveTransform(gaze_pt, H)
+                    ref_x, ref_y = mapped[0][0]
+
+                    if self._aoi is not None:
+                        is_in = self._point_in_aoi(ref_x, ref_y)
+                    else:
+                        is_in = 0 <= ref_x <= self.ref_w and 0 <= ref_y <= self.ref_h
+
+            in_aoi_flags.append(is_in)
+
+        # ---- Merge consecutive True frames into intervals ---- #
+        intervals: list[tuple[int, int]] = []  # (start_ms, end_ms)
+        in_interval = False
+        start_ms = 0
+
+        for frame_idx, is_in in enumerate(in_aoi_flags):
+            time_ms = int((scene_times[frame_idx] - rec_start) / 1e6)
+            if is_in and not in_interval:
+                in_interval = True
+                start_ms = time_ms
+            elif not is_in and in_interval:
+                in_interval = False
+                intervals.append((start_ms, time_ms))
+
+        # Close a trailing interval
+        if in_interval:
+            last_ms = int((scene_times[len(in_aoi_flags) - 1] - rec_start) / 1e6)
+            intervals.append((start_ms, last_ms))
+
+        if not intervals:
+            logger.info("No gaze-in-AOI intervals found — nothing to export")
+            return
+
+        # ---- Build EAF XML ---- #
+        ref_name = Path(self._reference_image_path).stem
+        tier_id = ref_name if ref_name else "ReferenceImage"
+
+        root = ET.Element("ANNOTATION_DOCUMENT", {
+            "AUTHOR": "ReferenceImageMapper",
+            "DATE": "",
+            "FORMAT": "3.0",
+            "VERSION": "3.0",
+            "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+            "xsi:noNamespaceSchemaLocation":
+                "http://www.mpi.nl/tools/elan/EAFv3.0.xsd",
+        })
+
+        header = ET.SubElement(root, "HEADER", {
+            "MEDIA_FILE": "",
+            "TIME_UNITS": "milliseconds",
+        })
+        ET.SubElement(header, "PROPERTY", {
+            "NAME": "URN",
+        }).text = ""
+
+        # Time slots
+        time_order = ET.SubElement(root, "TIME_ORDER")
+        ts_id = 1
+        slot_map: dict[int, str] = {}  # annotation_idx -> (ts_start_id, ts_end_id)
+        annotation_slots: list[tuple[str, str]] = []
+        for start, end in intervals:
+            ts_start = f"ts{ts_id}"
+            ts_end = f"ts{ts_id + 1}"
+            ET.SubElement(time_order, "TIME_SLOT", {
+                "TIME_SLOT_ID": ts_start,
+                "TIME_VALUE": str(start),
+            })
+            ET.SubElement(time_order, "TIME_SLOT", {
+                "TIME_SLOT_ID": ts_end,
+                "TIME_VALUE": str(end),
+            })
+            annotation_slots.append((ts_start, ts_end))
+            ts_id += 2
+
+        # Tier with annotations
+        tier = ET.SubElement(root, "TIER", {
+            "LINGUISTIC_TYPE_REF": "default-lt",
+            "TIER_ID": tier_id,
+        })
+
+        for ann_idx, (ts_start, ts_end) in enumerate(annotation_slots):
+            ann = ET.SubElement(tier, "ANNOTATION")
+            alignable = ET.SubElement(ann, "ALIGNABLE_ANNOTATION", {
+                "ANNOTATION_ID": f"a{ann_idx + 1}",
+                "TIME_SLOT_REF1": ts_start,
+                "TIME_SLOT_REF2": ts_end,
+            })
+            ET.SubElement(alignable, "ANNOTATION_VALUE").text = tier_id
+
+        # Linguistic type
+        ET.SubElement(root, "LINGUISTIC_TYPE", {
+            "GRAPHIC_REFERENCES": "false",
+            "LINGUISTIC_TYPE_ID": "default-lt",
+            "TIME_ALIGNABLE": "true",
+        })
+
+        # Write file
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="    ")
+        out_path = self.get_cache_path() / f"{tier_id}.eaf"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tree.write(str(out_path), encoding="unicode", xml_declaration=True)
+        logger.info("EAF exported to %s (%d annotations)", out_path, len(intervals))
 
     @property
     @property_params(min=4, max=100, step=1)
