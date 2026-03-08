@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QDialog, QLabel, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QFileDialog, QLabel, QVBoxLayout
 from qt_property_widgets.utilities import FilePath, property_params
 
 from pupil_labs import neon_player
@@ -930,7 +930,15 @@ class ReferenceImageMapper(neon_player.Plugin):
         # Write file
         tree = ET.ElementTree(root)
         ET.indent(tree, space="    ")
-        out_path = self.get_cache_path() / f"{tier_id}.eaf"
+        default_dir = str(self.recording._rec_dir) if self.recording else str(Path.home())
+        default_path = str(Path(default_dir) / f"{tier_id}.eaf")
+        out_path, _ = QFileDialog.getSaveFileName(
+            None, "Export EAF", default_path, "ELAN files (*.eaf)"
+        )
+        if not out_path:
+            logger.info("EAF export cancelled")
+            return
+        out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         tree.write(str(out_path), encoding="unicode", xml_declaration=True)
         logger.info("EAF exported to %s (%d annotations)", out_path, len(intervals))
