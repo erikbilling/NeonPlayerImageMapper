@@ -1020,7 +1020,7 @@ class ReferenceImageMapper(neon_player.Plugin):
 
                 start_ms = int((fixation_start - window_start_ns) / 1e6)
                 end_ms = int((fixation_end - window_start_ns) / 1e6)
-                fixation_annotations.append((start_ms, end_ms, f"fixation {idx + 1}"))
+                fixation_annotations.append((start_ms, end_ms, str(idx + 1)))
 
         # ---- Determine which window-frames have gaze inside the AOI ---- #
         in_aoi_flags: list[bool] = []
