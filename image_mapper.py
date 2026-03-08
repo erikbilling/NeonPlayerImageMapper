@@ -172,13 +172,53 @@ class ReferenceImageMapper(neon_player.Plugin):
         self._font = QFont("Arial", 12)
 
         self.mapping_job = None
+        self._disable_rebuild_on_next_cache_load = False
 
     # ------------------------------------------------------------------ #
     # Recording lifecycle
     # ------------------------------------------------------------------ #
 
     def on_recording_loaded(self, recording: NeonRecording) -> None:
+        duration_max = max(1, int(np.ceil(recording.duration / 1e9)))
+        self._set_time_option_max(duration_max)
+
+        # Clamp current values to the recording duration without triggering
+        # side effects like auto-enabling rebuild-on-export.
+        self._setting_state = True
+        self.start_time = min(max(0.0, self._start_time), float(duration_max))
+        self.stop_time = min(max(1.0, self._stop_time), float(duration_max))
+        self._setting_state = False
+
         self._try_load_reference_image()
+
+    def _set_time_option_max(self, max_value: int) -> None:
+        """Update start/stop option max values for both metadata and existing widgets."""
+        for prop_name in ("start_time", "stop_time"):
+            prop = getattr(self.__class__, prop_name, None)
+            if prop is None:
+                continue
+
+            if hasattr(prop, "fget") and hasattr(prop.fget, "parameters"):
+                prop.fget.parameters["max"] = max_value
+
+            if hasattr(prop, "binds"):
+                for widget in prop.binds.get(self, []):
+                    if hasattr(widget, "max"):
+                        widget.max = max_value
+
+    def _set_export_rebuild_option(self, value: bool) -> None:
+        """Set export action checkbox value and update bound UI widgets."""
+        action_obj = self._action_objects.get("export_eaf")
+        if action_obj is None or not hasattr(action_obj, "rebuild_mapping_on_export"):
+            return
+        action_obj.rebuild_mapping_on_export = value
+        action_obj.changed.emit()
+
+    def _get_export_rebuild_option(self) -> bool:
+        action_obj = self._action_objects.get("export_eaf")
+        if action_obj is None or not hasattr(action_obj, "rebuild_mapping_on_export"):
+            return False
+        return bool(action_obj.rebuild_mapping_on_export)
 
     # ------------------------------------------------------------------ #
     # Reference image loading
@@ -237,6 +277,35 @@ class ReferenceImageMapper(neon_player.Plugin):
         cache_file = self.get_cache_path() / "homographies.npy"
         if cache_file.exists():
             self.homographies = np.load(str(cache_file), allow_pickle=True).tolist()
+            if self._disable_rebuild_on_next_cache_load:
+                self._set_export_rebuild_option(False)
+                self._disable_rebuild_on_next_cache_load = False
+
+    def _rebuild_mapping_cache_for_export(self) -> bool:
+        """Rebuild mapping cache synchronously to guarantee fresh export data."""
+        if self.ref_image is None:
+            self._try_load_reference_image()
+            if self.ref_image is None:
+                logger.info("No reference image loaded")
+                return False
+
+        if self.mapping_job is not None:
+            logger.info("Mapping is currently being computed; wait for it to finish")
+            return False
+
+        cache_file = self.get_cache_path() / "homographies.npy"
+        if cache_file.exists():
+            cache_file.unlink()
+
+        for _ in self.bg_compute_homographies():
+            pass
+
+        self._load_cache()
+        if self.homographies is None:
+            logger.info("Failed to rebuild mapping cache")
+            return False
+
+        return True
 
     # ------------------------------------------------------------------ #
     # Background computation
@@ -307,7 +376,7 @@ class ReferenceImageMapper(neon_player.Plugin):
         # ============================================================== #
         # Forward pass  (ORB + forward optical flow)
         # ============================================================== #
-        for frame_idx, frame in enumerate(self.recording.scene):
+        for frame_idx in range(num_frames):
             result: dict[str, T.Any] = {"found": False, "H": None, "corners": None}
 
             elapsed = scene_times[frame_idx] - rec_start
@@ -323,6 +392,8 @@ class ReferenceImageMapper(neon_player.Plugin):
                 of_miss_streak = 0
                 yield ProgressUpdate((frame_idx + 1) / num_frames * 0.8)
                 continue
+
+            frame = self.recording.scene[frame_idx]
 
             scene_gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             frame_w, frame_h = frame.bgr.shape[1], frame.bgr.shape[0]
@@ -752,6 +823,8 @@ class ReferenceImageMapper(neon_player.Plugin):
     @start_time.setter
     def start_time(self, value: float) -> None:
         self._start_time = value
+        if not getattr(self, "_setting_state", False):
+            self._set_export_rebuild_option(True)
 
     @property
     @property_params(min=1, max=600, step=1)
@@ -761,6 +834,8 @@ class ReferenceImageMapper(neon_player.Plugin):
     @stop_time.setter
     def stop_time(self, value: float) -> None:
         self._stop_time = value
+        if not getattr(self, "_setting_state", False):
+            self._set_export_rebuild_option(True)
 
     @property
     @property_params(widget=None)
@@ -774,6 +849,7 @@ class ReferenceImageMapper(neon_player.Plugin):
             self.changed.emit()
 
     @neon_player.action
+    @action_params(compact=True, icon=QIcon.fromTheme("draw-polygon"))
     def area_of_interest(self) -> None:
         """Open a window to select an AOI quadrilateral on the reference image."""
         if self.ref_image is None:
@@ -803,24 +879,99 @@ class ReferenceImageMapper(neon_player.Plugin):
                 logger.info("AOI cleared")
 
     @neon_player.action
+    @action_params(compact=True, icon=QIcon.fromTheme("view-refresh"))
     def remap(self) -> None:
         """Clear cache and recompute homographies with current settings."""
         if self.ref_image is None:
             self._try_load_reference_image()
             return
+        self._disable_rebuild_on_next_cache_load = True
         cache_file = self.get_cache_path() / "homographies.npy"
         if cache_file.exists():
             cache_file.unlink()
         self._load_or_compute_cache()
 
     @neon_player.action
-    @action_params(compact=True, icon=QIcon(str(neon_player.asset_path("export.svg"))))
-    def export_eaf(self) -> None:
+    @action_params(icon=QIcon(str(neon_player.asset_path("export.svg"))))
+    def export_eaf(self, rebuild_mapping_on_export: bool = False) -> None:
         """Export gaze-in-AOI intervals as an ELAN (.eaf) annotation file
         together with a rendered MP4 video covering the start–stop window."""
-        if self.homographies is None or self.ref_image is None:
-            logger.info("No mapping data — run remap first")
+        if self.ref_image is None:
+            self._try_load_reference_image()
+        if self.ref_image is None:
+            logger.info("No reference image loaded")
             return
+
+        # ---- Ask user for save location before optional remapping ---- #
+        ref_name = Path(self._reference_image_path).stem
+        tier_id = ref_name if ref_name else "ReferenceImage"
+        default_dir = (
+            str(self.recording._rec_dir.parent)
+            if self.recording
+            else str(Path.home())
+        )
+        recording_name = self.recording._rec_dir.name if self.recording else tier_id
+        default_path = str(Path(default_dir) / f"{recording_name}.eaf")
+        file_dialog = QFileDialog(self.app.main_window)
+        file_dialog.setWindowTitle("Export EAF")
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        file_dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        file_dialog.setNameFilter("ELAN files (*.eaf)")
+        file_dialog.selectFile(default_path)
+        # Use a Qt-managed modal dialog so key events do not propagate to the main window.
+        file_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        file_dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+
+        if file_dialog.exec() != QDialog.DialogCode.Accepted:
+            logger.info("EAF export cancelled")
+            return
+        selected = file_dialog.selectedFiles()
+        if not selected:
+            logger.info("EAF export cancelled")
+            return
+        out_path = Path(selected[0])
+
+        if not self.app.headless:
+            self.job_manager.run_background_action(
+                "Export ELAN + Video",
+                "ReferenceImageMapper.bg_export_eaf",
+                out_path,
+                int(rebuild_mapping_on_export),
+            )
+            return
+
+        for _ in self.bg_export_eaf(out_path, int(rebuild_mapping_on_export)):
+            pass
+
+    def bg_export_eaf(
+        self,
+        out_path: Path = Path(),
+        rebuild_mapping: int = 0,
+    ) -> T.Generator[ProgressUpdate, None, None]:
+        """Background export job with progress updates for remapping and video export."""
+        if self.ref_image is None:
+            self._try_load_reference_image()
+        if self.ref_image is None:
+            logger.info("No reference image loaded")
+            return
+
+        rebuild = bool(rebuild_mapping)
+        needs_mapping = rebuild or self.homographies is None
+
+        map_phase = 0.5 if needs_mapping else 0.0
+        export_base = map_phase
+        export_scale = 1.0 - export_base
+
+        if needs_mapping:
+            for update in self.bg_compute_homographies():
+                yield ProgressUpdate(update.progress * map_phase)
+            self._load_cache()
+            if self.homographies is None:
+                logger.info("No mapping data — run remap first")
+                return
+
+        ref_name = Path(self._reference_image_path).stem
+        tier_id = ref_name if ref_name else "ReferenceImage"
 
         # ---- Identify frames inside the start/stop window ---- #
         scene_times = self.recording.scene.time
@@ -887,31 +1038,18 @@ class ReferenceImageMapper(neon_player.Plugin):
             logger.info("No gaze-in-AOI intervals found — nothing to export")
             return
 
-        # ---- Ask user for save location ---- #
-        ref_name = Path(self._reference_image_path).stem
-        tier_id = ref_name if ref_name else "ReferenceImage"
-        default_dir = (
-            str(self.recording._rec_dir.parent)
-            if self.recording
-            else str(Path.home())
-        )
-        recording_name = self.recording._rec_dir.name if self.recording else tier_id
-        default_path = str(Path(default_dir) / f"{recording_name}.eaf")
-        out_path, _ = QFileDialog.getSaveFileName(
-            None, "Export EAF", default_path, "ELAN files (*.eaf)"
-        )
-        if not out_path:
-            logger.info("EAF export cancelled")
-            return
-        out_path = Path(out_path)
-
         # ---- Export rendered MP4 video ---- #
         video_path = out_path.with_suffix(".mp4")
-        if not export_video(video_path, scene_times, window_indices):
+        try:
+            for video_progress in export_video(video_path, scene_times, window_indices):
+                yield ProgressUpdate(export_base + video_progress * export_scale)
+        except Exception:
+            logger.exception("Failed to export video")
             return
 
         # ---- Write EAF file ---- #
         write_eaf(out_path, tier_id, intervals, video_filename=video_path.name)
+        yield ProgressUpdate(1.0)
 
     @property
     @property_params(min=4, max=100, step=1)

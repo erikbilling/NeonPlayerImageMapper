@@ -1,11 +1,10 @@
 import logging
+import typing as T
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPainter
-from PySide6.QtWidgets import QProgressDialog
 
 from pupil_labs import neon_player
 
@@ -16,11 +15,11 @@ def export_video(
     video_path: Path,
     scene_times: np.ndarray,
     window_indices: list[int],
-) -> bool:
+) -> T.Generator[float, None, None]:
     """Render the Neon Player scene (with all plugin overlays) for every
     frame in *window_indices* and write the result to an MP4 file.
 
-    Returns True on success, False on failure or cancellation.
+    Yields progress in the range [0.0, 1.0]. Raises RuntimeError on failure.
     """
     app = neon_player.instance()
     vid_w = app.recording.scene.width
@@ -39,22 +38,10 @@ def export_video(
     writer = cv2.VideoWriter(str(video_path), fourcc, fps, (vid_w, vid_h))
 
     if not writer.isOpened():
-        logger.error("Failed to open video writer for %s", video_path)
-        return False
-
-    progress = QProgressDialog("Exporting video…", "Cancel", 0, n_frames)
-    progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-    progress.setMinimumDuration(0)
+        raise RuntimeError(f"Failed to open video writer for {video_path}")
 
     try:
         for seq, frame_idx in enumerate(window_indices):
-            if progress.wasCanceled():
-                logger.info("Video export cancelled")
-                writer.release()
-                if video_path.exists():
-                    video_path.unlink()
-                return False
-
             ts = int(scene_times[frame_idx])
 
             qimg = QImage(vid_w, vid_h, QImage.Format.Format_ARGB32)
@@ -73,12 +60,10 @@ def export_video(
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             writer.write(bgr)
 
-            progress.setValue(seq + 1)
+            yield (seq + 1) / n_frames
     finally:
         writer.release()
-        progress.close()
 
     logger.info(
         "Video exported to %s (%d frames, %.2f fps)", video_path, n_frames, fps
     )
-    return True
