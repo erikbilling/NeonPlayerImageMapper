@@ -10,6 +10,7 @@ def write_eaf(
     tier_id: str,
     intervals: list[tuple[int, int]],
     video_filename: str | None = None,
+    fixation_annotations: list[tuple[int, int, str]] | None = None,
 ) -> None:
     """Build and write an ELAN (.eaf) annotation file.
 
@@ -43,35 +44,49 @@ def write_eaf(
     # Time slots
     time_order = ET.SubElement(root, "TIME_ORDER")
     ts_id = 1
-    annotation_slots: list[tuple[str, str]] = []
-    for start, end in intervals:
-        ts_start = f"ts{ts_id}"
-        ts_end = f"ts{ts_id + 1}"
-        ET.SubElement(time_order, "TIME_SLOT", {
-            "TIME_SLOT_ID": ts_start,
-            "TIME_VALUE": str(start),
-        })
-        ET.SubElement(time_order, "TIME_SLOT", {
-            "TIME_SLOT_ID": ts_end,
-            "TIME_VALUE": str(end),
-        })
-        annotation_slots.append((ts_start, ts_end))
-        ts_id += 2
+    ann_id = 1
 
-    # Tier with annotations
-    tier = ET.SubElement(root, "TIER", {
-        "LINGUISTIC_TYPE_REF": "default-lt",
-        "TIER_ID": tier_id,
-    })
+    def add_tier(
+        tier_name: str,
+        annotations: list[tuple[int, int, str]],
+    ) -> int:
+        nonlocal ts_id, ann_id
 
-    for ann_idx, (ts_start, ts_end) in enumerate(annotation_slots):
-        ann = ET.SubElement(tier, "ANNOTATION")
-        alignable = ET.SubElement(ann, "ALIGNABLE_ANNOTATION", {
-            "ANNOTATION_ID": f"a{ann_idx + 1}",
-            "TIME_SLOT_REF1": ts_start,
-            "TIME_SLOT_REF2": ts_end,
+        tier = ET.SubElement(root, "TIER", {
+            "LINGUISTIC_TYPE_REF": "default-lt",
+            "TIER_ID": tier_name,
         })
-        ET.SubElement(alignable, "ANNOTATION_VALUE").text = tier_id
+
+        for start, end, label in annotations:
+            ts_start = f"ts{ts_id}"
+            ts_end = f"ts{ts_id + 1}"
+            ET.SubElement(time_order, "TIME_SLOT", {
+                "TIME_SLOT_ID": ts_start,
+                "TIME_VALUE": str(start),
+            })
+            ET.SubElement(time_order, "TIME_SLOT", {
+                "TIME_SLOT_ID": ts_end,
+                "TIME_VALUE": str(end),
+            })
+            ts_id += 2
+
+            ann = ET.SubElement(tier, "ANNOTATION")
+            alignable = ET.SubElement(ann, "ALIGNABLE_ANNOTATION", {
+                "ANNOTATION_ID": f"a{ann_id}",
+                "TIME_SLOT_REF1": ts_start,
+                "TIME_SLOT_REF2": ts_end,
+            })
+            ET.SubElement(alignable, "ANNOTATION_VALUE").text = label
+            ann_id += 1
+
+        return len(annotations)
+
+    main_annotations = [(start, end, tier_id) for start, end in intervals]
+    main_count = add_tier(tier_id, main_annotations)
+
+    fixation_count = 0
+    if fixation_annotations:
+        fixation_count = add_tier("fixations", fixation_annotations)
 
     # Linguistic type
     ET.SubElement(root, "LINGUISTIC_TYPE", {
@@ -85,4 +100,9 @@ def write_eaf(
     ET.indent(tree, space="    ")
     eaf_path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(str(eaf_path), encoding="unicode", xml_declaration=True)
-    logger.info("EAF exported to %s (%d annotations)", eaf_path, len(intervals))
+    logger.info(
+        "EAF exported to %s (%d AOI + %d fixation annotations)",
+        eaf_path,
+        main_count,
+        fixation_count,
+    )

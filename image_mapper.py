@@ -1005,6 +1005,22 @@ class ReferenceImageMapper(neon_player.Plugin):
             return
 
         window_start_ns = scene_times[window_indices[0]]
+        window_end_ns = scene_times[window_indices[-1]]
+
+        fixation_annotations: list[tuple[int, int, str]] = []
+        if hasattr(self.recording, "fixations"):
+            for idx, fixation in enumerate(self.recording.fixations):
+                fixation_start = int(fixation.start_time)
+                fixation_end = int(fixation.stop_time)
+
+                # Keep original fixation duration by only including fixations
+                # fully contained in the exported time window.
+                if fixation_start < window_start_ns or fixation_end > window_end_ns:
+                    continue
+
+                start_ms = int((fixation_start - window_start_ns) / 1e6)
+                end_ms = int((fixation_end - window_start_ns) / 1e6)
+                fixation_annotations.append((start_ms, end_ms, f"fixation {idx + 1}"))
 
         # ---- Determine which window-frames have gaze inside the AOI ---- #
         in_aoi_flags: list[bool] = []
@@ -1075,7 +1091,13 @@ class ReferenceImageMapper(neon_player.Plugin):
             return
 
         # ---- Write EAF file ---- #
-        write_eaf(out_path, tier_id, intervals, video_filename=video_path.name)
+        write_eaf(
+            out_path,
+            tier_id,
+            intervals,
+            video_filename=video_path.name,
+            fixation_annotations=fixation_annotations,
+        )
         yield ProgressUpdate(1.0)
 
     @property
