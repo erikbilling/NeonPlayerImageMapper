@@ -941,13 +941,15 @@ class ReferenceImageMapper(neon_player.Plugin):
         out_path = Path(selected[0])
 
         if not self.app.headless:
-            self.job_manager.run_background_action(
+            job = self.job_manager.run_background_action(
                 "Export ELAN + Video",
                 "ReferenceImageMapper.bg_export_eaf",
                 out_path,
                 int(rebuild_mapping_on_export),
                 int(merge_gap_ms),
             )
+            if rebuild_mapping_on_export:
+                job.finished.connect(lambda: self._set_export_rebuild_option(False))
             return
 
         for _ in self.bg_export_eaf(
@@ -956,6 +958,8 @@ class ReferenceImageMapper(neon_player.Plugin):
             int(merge_gap_ms),
         ):
             pass
+        if rebuild_mapping_on_export:
+            self._set_export_rebuild_option(False)
 
     def bg_export_eaf(
         self,
@@ -1078,8 +1082,7 @@ class ReferenceImageMapper(neon_player.Plugin):
             intervals = merged_intervals
 
         if not intervals:
-            logger.info("No gaze-in-AOI intervals found — nothing to export")
-            return
+            logger.info("No gaze-in-AOI intervals found — exporting without AOI annotations")
 
         # ---- Export rendered MP4 video ---- #
         video_path = out_path.with_suffix(".mp4")
