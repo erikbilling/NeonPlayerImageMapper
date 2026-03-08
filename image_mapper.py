@@ -776,21 +776,11 @@ class ReferenceImageMapper(neon_player.Plugin):
             painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
         if has_gaze and in_region:
-            # Draw gaze circle on the scene at the original gaze position
-            painter.setPen(QPen(self.gaze_color, 2, Qt.PenStyle.SolidLine))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(
-                int(gaze_x) - self.gaze_radius,
-                int(gaze_y) - self.gaze_radius,
-                self.gaze_radius * 2,
-                self.gaze_radius * 2,
-            )
-
             # Show mapped coordinates as text
             painter.setFont(self._font)
             painter.setPen(QPen(self.gaze_color, 1))
             label = f"AOI: ({ref_x:.0f}, {ref_y:.0f})"
-            painter.drawText(int(gaze_x) + self.gaze_radius + 5, int(gaze_y) + 5, label)
+            painter.drawText(int(gaze_x) + 5, int(gaze_y) + 5, label)
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -849,7 +839,7 @@ class ReferenceImageMapper(neon_player.Plugin):
             self.changed.emit()
 
     @neon_player.action
-    @action_params(compact=True, icon=QIcon.fromTheme("draw-polygon"))
+    @action_params(compact=True, icon=QIcon.fromTheme("draw-rectangle"))
     def area_of_interest(self) -> None:
         """Open a window to select an AOI quadrilateral on the reference image."""
         if self.ref_image is None:
