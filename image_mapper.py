@@ -890,7 +890,11 @@ class ReferenceImageMapper(neon_player.Plugin):
         # ---- Ask user for save location ---- #
         ref_name = Path(self._reference_image_path).stem
         tier_id = ref_name if ref_name else "ReferenceImage"
-        default_dir = str(self.recording._rec_dir) if self.recording else str(Path.home())
+        default_dir = (
+            str(self.recording._rec_dir.parent)
+            if self.recording
+            else str(Path.home())
+        )
         recording_name = self.recording._rec_dir.name if self.recording else tier_id
         default_path = str(Path(default_dir) / f"{recording_name}.eaf")
         out_path, _ = QFileDialog.getSaveFileName(
