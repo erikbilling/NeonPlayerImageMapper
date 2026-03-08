@@ -247,6 +247,10 @@ class ReferenceImageMapper(neon_player.Plugin):
         Lucas-Kanade optical flow tracking from the last good detection
         when ORB fails, which helps bridge frames with motion blur or
         temporary occlusion.
+
+        After the forward pass a backward optical-flow pass propagates
+        detections to frames *before* the first ORB hit of each sequence,
+        which is critical for recovering short appearances.
         """
 
         orb = cv2.ORB_create(nfeatures=2000)
@@ -272,12 +276,10 @@ class ReferenceImageMapper(neon_player.Plugin):
         )
         # State for optical flow fallback
         prev_gray: np.ndarray | None = None
-        # Points in the *previous* scene frame that correspond to ref_pts_for_of
         prev_scene_pts: np.ndarray | None = None
-        # Matching reference-image coordinates for those scene points
         ref_pts_for_of: np.ndarray | None = None
-        of_miss_streak = 0  # consecutive frames tracked only by OF
-        max_of_streak = 10  # reset OF tracking after this many frames
+        of_miss_streak = 0
+        max_of_streak = 10
 
         homographies: list[dict[str, T.Any]] = []
         num_frames = len(self.recording.scene)
@@ -286,23 +288,36 @@ class ReferenceImageMapper(neon_player.Plugin):
         start_ns = int(self._start_time * 1e9)
         stop_ns = int(self._stop_time * 1e9)
 
+        # We need frame indices that are inside the time window for the
+        # backward pass, and we store per-frame ORB inlier data for seeding.
+        in_window: list[bool] = []
+        # Per-frame ORB inlier data: (src_pts_inliers, dst_pts_inliers) or None
+        orb_inlier_data: list[tuple[np.ndarray, np.ndarray] | None] = []
+
+        # ============================================================== #
+        # Forward pass  (ORB + forward optical flow)
+        # ============================================================== #
         for frame_idx, frame in enumerate(self.recording.scene):
             result: dict[str, T.Any] = {"found": False, "H": None, "corners": None}
 
-            # Skip frames outside the start/stop time window
             elapsed = scene_times[frame_idx] - rec_start
-            if elapsed < start_ns or elapsed > stop_ns:
+            is_in_window = start_ns <= elapsed <= stop_ns
+            in_window.append(is_in_window)
+
+            if not is_in_window:
                 homographies.append(result)
+                orb_inlier_data.append(None)
                 prev_gray = None
                 prev_scene_pts = None
                 ref_pts_for_of = None
                 of_miss_streak = 0
-                yield ProgressUpdate((frame_idx + 1) / num_frames)
+                yield ProgressUpdate((frame_idx + 1) / num_frames * 0.8)
                 continue
 
             scene_gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             frame_w, frame_h = frame.bgr.shape[1], frame.bgr.shape[0]
             orb_matched = False
+            frame_orb_data = None
 
             # ---- Primary: ORB feature matching ----
             kp_scene, des_scene = orb.detectAndCompute(scene_gray, None)
@@ -349,13 +364,16 @@ class ReferenceImageMapper(neon_player.Plugin):
                             }
                             orb_matched = True
 
-                            # Seed optical-flow state with ORB inliers
                             inlier_mask = mask.ravel().astype(bool)
                             prev_scene_pts = dst_pts[inlier_mask].copy()
                             ref_pts_for_of = src_pts[inlier_mask].copy()
                             of_miss_streak = 0
+                            frame_orb_data = (
+                                ref_pts_for_of.copy(),
+                                prev_scene_pts.copy(),
+                            )
 
-            # ---- Fallback: Lucas-Kanade optical flow ----
+            # ---- Fallback: forward Lucas-Kanade optical flow ----
             if (
                 not orb_matched
                 and prev_gray is not None
@@ -396,7 +414,6 @@ class ReferenceImageMapper(neon_player.Plugin):
                                     "corners": corners_2d.tolist(),
                                 }
 
-                                # Keep only inliers for next iteration
                                 inlier_mask = mask.ravel().astype(bool)
                                 prev_scene_pts = tracked_scene[
                                     inlier_mask
@@ -410,19 +427,118 @@ class ReferenceImageMapper(neon_player.Plugin):
             if orb_matched or result["found"]:
                 prev_gray = scene_gray
             elif prev_gray is not None:
-                # Even on failure, advance prev_gray so OF can still
-                # try on the next frame
                 prev_gray = scene_gray
 
             if not result["found"] and not orb_matched:
-                # Lost tracking — reset OF state after streak exceeded
                 if of_miss_streak >= max_of_streak:
                     prev_scene_pts = None
                     ref_pts_for_of = None
                     of_miss_streak = 0
 
             homographies.append(result)
-            yield ProgressUpdate((frame_idx + 1) / num_frames)
+            orb_inlier_data.append(frame_orb_data)
+            yield ProgressUpdate((frame_idx + 1) / num_frames * 0.8)
+
+        # ============================================================== #
+        # Backward pass  (optical flow from detected → preceding frames)
+        # ============================================================== #
+        # Walk backward through the frames. Whenever we hit a detected
+        # frame that has ORB inlier data, propagate backward via OF into
+        # preceding un-detected frames.  This fills the gap *before* the
+        # first ORB hit of each short sequence.
+        max_backward = max_of_streak
+        backward_filled = 0
+
+        next_gray: np.ndarray | None = None
+        next_scene_pts: np.ndarray | None = None
+        next_ref_pts: np.ndarray | None = None
+        bw_streak = 0
+
+        for frame_idx in range(num_frames - 1, -1, -1):
+            if not in_window[frame_idx]:
+                next_gray = None
+                next_scene_pts = None
+                next_ref_pts = None
+                bw_streak = 0
+                continue
+
+            frame = self.recording.scene[frame_idx]
+            scene_gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
+            frame_w, frame_h = frame.bgr.shape[1], frame.bgr.shape[0]
+
+            if homographies[frame_idx]["found"]:
+                # Seed backward tracking from this frame's ORB data
+                if orb_inlier_data[frame_idx] is not None:
+                    next_ref_pts, next_scene_pts = orb_inlier_data[frame_idx]
+                next_gray = scene_gray
+                bw_streak = 0
+            elif (
+                next_gray is not None
+                and next_scene_pts is not None
+                and bw_streak < max_backward
+            ):
+                # Track backward: from next_gray → scene_gray (this frame)
+                prev_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    next_gray, scene_gray, next_scene_pts, None, **lk_params
+                )
+                if prev_pts is not None and status is not None:
+                    good_mask = status.ravel() == 1
+                    tracked_scene = prev_pts[good_mask]
+                    tracked_ref = next_ref_pts[good_mask]
+
+                    if len(tracked_scene) >= self._min_matches:
+                        H, mask = cv2.findHomography(
+                            tracked_scene, tracked_ref, cv2.RANSAC, 5.0
+                        )
+                        inlier_ratio = (
+                            mask.sum() / len(mask)
+                            if mask is not None
+                            else 0
+                        )
+
+                        if H is not None and inlier_ratio >= 0.35:
+                            H_inv = np.linalg.inv(H)
+                            scene_corners = cv2.perspectiveTransform(
+                                ref_corners, H_inv
+                            )
+                            corners_2d = scene_corners.reshape(-1, 2)
+
+                            if self._is_valid_detection(
+                                corners_2d, frame_w, frame_h
+                            ):
+                                homographies[frame_idx] = {
+                                    "found": True,
+                                    "H": H.tolist(),
+                                    "corners": corners_2d.tolist(),
+                                }
+                                backward_filled += 1
+
+                                inlier_mask = mask.ravel().astype(bool)
+                                next_scene_pts = tracked_scene[
+                                    inlier_mask
+                                ].reshape(-1, 1, 2).copy()
+                                next_ref_pts = tracked_ref[
+                                    inlier_mask
+                                ].reshape(-1, 1, 2).copy()
+                                next_gray = scene_gray
+                                bw_streak += 1
+                                continue
+
+                # Tracking failed — reset
+                next_gray = None
+                next_scene_pts = None
+                next_ref_pts = None
+                bw_streak = 0
+            else:
+                next_gray = None
+                next_scene_pts = None
+                next_ref_pts = None
+                bw_streak = 0
+
+        if backward_filled:
+            logger.info("Backward OF pass filled %d additional frames", backward_filled)
+
+        yield ProgressUpdate(1.0)
 
         destination = self.get_cache_path() / "homographies.npy"
         destination.parent.mkdir(parents=True, exist_ok=True)
